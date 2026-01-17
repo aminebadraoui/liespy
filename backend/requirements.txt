@@ -9,3 +9,9 @@ openai
 python-dotenv
 pytest
 httpx
+sqlmodel
+alembic
+asyncpg
+greenlet
+langchain-openai
+

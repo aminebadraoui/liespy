@@ -1,67 +1,99 @@
 from typing import List, Dict, Any, TypedDict
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
-from backend.api.schemas import ScanResult, Claim
+from api.schemas import ScanResult, Claim
 
-# Mocking LLM for now, in production use ChatOpenAI or similar
-class MockLLM:
-    def invoke(self, messages):
-        # This simulates the LLM response
-        content = """
-        {
-            "page_risk": "high",
-            "claims": [
-                {
-                    "text": "This pill cures all cancer instantly.",
-                    "risk": "high",
-                    "category": "Health",
-                    "explanation": "No single pill cures all cancer. This is a dangerous medical claim.",
-                    "confidence": 0.95
-                }
-            ]
-        }
-        """
-        return type('obj', (object,), {'content': content})
+import json
+import openai
+from pydantic import ValidationError
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from core.config import settings
 
-llm = MockLLM()
 
 class ScanState(TypedDict):
     candidates: List[str]
     results: Dict[str, Any]
 
-def filter_candidates(state: ScanState):
-    # Logic to filter out irrelevant candidates
-    # In real impl, use LLM or heuristics
-    return {"candidates": state["candidates"]}
+# Initialize Real LLM (Perplexity via OpenAI-compatible API)
+
+llm = ChatOpenAI(
+    api_key=settings.OPENAI_API_KEY,
+    base_url=settings.LLM_BASE_URL,
+    model=settings.LLM_MODEL,
+    temperature=0.1
+)
 
 def classify_claims(state: ScanState):
-    # Call LLM to classify
-    # mock response creation
-    claims = []
-    for candidate in state["candidates"]:
-        # Logic to skip some
-        if "cancer" in candidate:
-             claims.append(Claim(
-                 text=candidate,
-                 risk_level="high",
-                 category="Health",
-                 explanation="Medical claim without evidence.",
-                 confidence=0.9
-             ))
+    candidates = state["candidates"]
+    if not candidates:
+        return {"results": {"page_risk": "low", "trust_score": 100, "summary": "No risky content found.", "claims": []}}
+
+    # Construct Prompt
+    candidates_text = "\n".join([f"- {c}" for c in candidates])
     
-    result = ScanResult(
-        page_risk="high" if claims else "low",
-        claims=claims
-    )
-    return {"results": result.model_dump()}
+    system_prompt = """
+    You are an expert fact-checker for older adults. 
+    Analyze the provided text candidates from a webpage.
+    Identify any CLAIMS that are:
+    1. Health misinformation (fake cures, anti-science).
+    2. Financial scams (guaranteed returns, immediate wealth).
+    3. Urgent pressure tactics (limited time, act now).
+    4. Deceptive Marketing (advertorials masquerading as news/reviews, fake endorsements).
+    
+    Return a JSON object with this structure:
+    {
+        "page_risk": "low" | "medium" | "high",
+        "trust_score": 0 to 100 (integer),
+        "summary": "Start with 'This page seems...' or similar. Keep it under 15 words.",
+        "claims": [
+            {
+                "text": "The exact text of the claim",
+                "risk_level": "medium" | "high",
+                "category": "Health" | "Financial" | "Urgency" | "Deceptive" | "Other",
+                "explanation": "A simple, clear explanation of why this is misleading.",
+                "confidence": 0.0 to 1.0
+            }
+        ]
+    }
+    
+    If no risky claims are found, return {"page_risk": "low", "trust_score": 90, "summary": "This page appears to be safe.", "claims": []}.
+    """
+    
+    user_message = f"Here are the text snippets to analyze:\n{candidates_text}"
+    
+    try:
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_message)
+        ])
+        
+        # Parse JSON
+        content = response.content
+        # Simple cleanup if the model adds markdown code blocks
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+            
+        data = json.loads(content.strip())
+        scan_result = ScanResult(**data)
+        return {"results": scan_result.model_dump()}
+        
+    except Exception as e:
+        print(f"LLM Error: {e}")
+        # Fallback for error
+    except Exception as e:
+        print(f"LLM Error: {e}")
+        # Fallback for error
+        return {"results": {"page_risk": "unknown", "trust_score": 50, "summary": "Analysis failed.", "claims": []}}
 
 # Define the graph
 workflow = StateGraph(ScanState)
-workflow.add_node("filter", filter_candidates)
+# Skip filter node for now, standard pass-through
 workflow.add_node("classify", classify_claims)
 
-workflow.set_entry_point("filter")
-workflow.add_edge("filter", "classify")
+workflow.set_entry_point("classify")
 workflow.add_edge("classify", END)
 
 app_pipeline = workflow.compile()
@@ -72,6 +104,4 @@ async def run_page_scan(candidates: List[str]) -> ScanResult:
     return ScanResult(**output["results"])
 
 async def run_text_scan(text: str) -> ScanResult:
-    # Simplified single text scan
-    # Reusing the same pipeline logic for simplicity in this artifact
     return await run_page_scan([text])

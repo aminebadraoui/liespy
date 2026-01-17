@@ -14,6 +14,8 @@ class Claim(BaseModel):
 
 class ScanResult(BaseModel):
     page_risk: str
+    trust_score: int = Field(..., description="0-100 score, where 100 is highly credible and 0 is a scam.")
+    summary: str = Field(..., description="A short, one-sentence commentary explaining the score.")
     claims: List[Claim]
 
 # --- Requests ---
@@ -21,6 +23,7 @@ class ScanResult(BaseModel):
 class PageScanRequest(BaseModel):
     url: Optional[str] = None
     candidates: List[str] # List of extracted sentences
+    force_refresh: bool = False
 
 class TextScanRequest(BaseModel):
     text: str
@@ -32,3 +35,4 @@ class ScanResponse(BaseModel):
     scan_id: UUID
     result: ScanResult
     created_at: datetime
+    is_cached: bool = False

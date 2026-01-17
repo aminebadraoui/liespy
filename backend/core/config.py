@@ -8,9 +8,12 @@ class Settings(BaseSettings):
     # Supabase
     SUPABASE_URL: str
     SUPABASE_KEY: str
+    DATABASE_URL: str
     
     # AI / LLM
     OPENAI_API_KEY: str
+    LLM_BASE_URL: str = "https://api.perplexity.ai"
+    LLM_MODEL: str = "sonar-pro"
     
     class Config:
         env_file = ".env"
