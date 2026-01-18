@@ -8,11 +8,9 @@ When setting up the resource in Coolify, use the following settings:
 
 | Setting           | Value                                                  |
 |-------------------|--------------------------------------------------------|
-| **Build Pack**    | Nixpacks                                               |
+| **Build Pack**    | Dockerfile                                             |
 | **Base Directory**| `/backend`                                             |
-| **Install Command**| `pip install -r requirements.txt`                      |
-| **Build Command** | *(Leave Empty)*                                        |
-| **Start Command** | `python -m uvicorn main:app --host 0.0.0.0 --port 8000`|
+| **Dockerfile Path**| `Dockerfile`                                          |
 | **Ports Exposes** | `8000`                                                 |
 
 ## Environment Variables
