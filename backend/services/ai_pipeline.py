@@ -32,12 +32,43 @@ def split_text(text: str, chunk_size: int = 20000, overlap: int = 500) -> List[s
 
 # --- Agencies ---
 
+
+def extract_json(text: str) -> Dict[str, Any]:
+    """Robustly extracts JSON from LLM response text."""
+    try:
+        # 1. Try direct parsing
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Extract code block
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0]
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0]
+    
+    # 3. Find first { and last }
+    text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    
+    if start != -1 and end != -1:
+        json_str = text[start:end+1]
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse extracted JSON: {e}")
+    
+    raise ValueError("No JSON object found in text")
+
+# --- Agencies ---
+
 async def extract_content(candidates: List[str]) -> str:
     """Extracts clean text from raw HTML/candidates."""
     if not candidates:
         return ""
         
-    full_text = "\n".join(candidates)
+    full_text = "\\n".join(candidates)
     
     system_prompt = """
     You are an expert content extractor. Your job is to take raw text from a webpage and extract the MAIN ARTICLE CONTENT.
@@ -51,7 +82,7 @@ async def extract_content(candidates: List[str]) -> str:
         # but realistically the client sends decent candidates.
         response = await llm.ainvoke([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"RAW TEXT:\n{full_text[:50000]}") 
+            HumanMessage(content=f"RAW TEXT:\\n{full_text[:50000]}") 
         ])
         return response.content
     except Exception as e:
@@ -89,19 +120,15 @@ async def identify_claims_in_chunk(chunk: str) -> List[str]:
     try:
         response = await invoke_with_retry([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"TEXT CHUNK:\n{chunk}")
+            HumanMessage(content=f"TEXT CHUNK:\\n{chunk}")
         ])
         
         content = response.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-            
-        data = json.loads(content)
+        data = extract_json(content)
         return data.get("claims", [])
     except Exception as e:
         print(f"Identification Error: {e}")
+        print(f"RAW IDENTIFICATION RESPONSE: {response.content if 'response' in locals() else 'None'}")
         return []
 
 async def verify_chunk_claims(chunk: str, claims: List[str]) -> List[Dict[str, Any]]:
@@ -109,7 +136,7 @@ async def verify_chunk_claims(chunk: str, claims: List[str]) -> List[Dict[str, A
     if not claims:
         return []
         
-    claims_text = "\n- ".join(claims)
+    claims_text = "\\n- ".join(claims)
     
     system_prompt = """
     You are an expert fact-checker. Analyze the provided claims based on the text context.
@@ -132,20 +159,17 @@ async def verify_chunk_claims(chunk: str, claims: List[str]) -> List[Dict[str, A
     try:
         response = await invoke_with_retry([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"CONTEXT:\n{chunk}\n\nCLAIMS TO VERIFY:\n- {claims_text}")
+            HumanMessage(content=f"CONTEXT:\\n{chunk}\\n\\nCLAIMS TO VERIFY:\\n- {claims_text}")
         ])
         
         content = response.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-            
-        data = json.loads(content)
+        data = extract_json(content)
         return data.get("verified_claims", [])
     except Exception as e:
         print(f"Verification Error: {e}")
+        print(f"RAW VERIFICATION RESPONSE: {response.content if 'response' in locals() else 'None'}")
         return []
+
 
 async def analyze_aggregated_results(all_claims: List[Dict[str, Any]], full_text_summary: str) -> ScanResult:
     """Calculates final score and summary based on all verified claims."""
@@ -171,16 +195,12 @@ async def analyze_aggregated_results(all_claims: List[Dict[str, Any]], full_text
     try:
         response = await llm.ainvoke([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"VERIFIED CLAIMS:\n{claims_dump}\n\nPAGE CONTEXT SUMMARY:\n{full_text_summary[:5000]}")
+            HumanMessage(content=f"VERIFIED CLAIMS:\\n{claims_dump}\\n\\nPAGE CONTEXT SUMMARY:\\n{full_text_summary[:5000]}")
         ])
         
         content = response.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-            
-        data = json.loads(content)
+        data = extract_json(content)
+        
         # We manually construct ScanResult to ensure we keep the claims
         return ScanResult(
             page_risk=data.get("page_risk", "medium"),
@@ -190,12 +210,14 @@ async def analyze_aggregated_results(all_claims: List[Dict[str, Any]], full_text
         )
     except Exception as e:
         print(f"Aggregation Error: {e}")
+        print(f"RAW AGGREGATION RESPONSE: {response.content if 'response' in locals() else 'None'}")
         return ScanResult(
             page_risk="unknown",
             trust_score=50,
             summary="Failed to generate final score.",
             claims=all_claims
         )
+
 
 # --- Orchestrator ---
 
