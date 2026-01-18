@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from uuid import UUID
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -33,6 +33,16 @@ class TextScanRequest(BaseModel):
     url: Optional[str] = None
 
 # --- Responses ---
+
+class ScanChunkRequest(BaseModel):
+    chunk: str
+    metadata: Dict[str, str] = {}
+    indicators: List[str] = []
+
+class ScanAggregateRequest(BaseModel):
+    verified_claims: List[Dict[str, Any]] # List of claims (partial dicts or Claim model dumps)
+    metadata: Dict[str, str] = {}
+    full_text_summary: str = Field(default="", description="Optional summary or full text context if available")
 
 class ScanResponse(BaseModel):
     scan_id: UUID

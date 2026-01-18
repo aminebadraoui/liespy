@@ -1,23 +1,11 @@
 from typing import List, Dict, Any, TypedDict
 from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.graph import StateGraph, END
 from api.schemas import ScanResult, Claim
 
 import json
-import openai
-from pydantic import ValidationError
+import asyncio
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
 from core.config import settings
-
-
-class ScanState(TypedDict):
-    candidates: List[str] # Input raw text chunks
-    metadata: Dict[str, str]
-    indicators: List[str]
-    clean_text: str # Output of extractor
-    extracted_claims: List[str] # Output of identifier
-    results: Dict[str, Any] # Output of verifier
 
 # Initialize Real LLM
 llm = ChatOpenAI(
@@ -27,184 +15,222 @@ llm = ChatOpenAI(
     temperature=0.1
 )
 
-# Application of "Extraction" Agency
-def extract_content(state: ScanState):
-    raw_candidates = state.get("candidates", [])
-    if not raw_candidates:
-        return {"clean_text": ""}
+# --- Utilities ---
+
+def split_text(text: str, chunk_size: int = 20000, overlap: int = 500) -> List[str]:
+    """Splits text into larger chunks for processing."""
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    text_len = len(text)
+    while start < text_len:
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - overlap
+    return chunks
+
+# --- Agencies ---
+
+async def extract_content(candidates: List[str]) -> str:
+    """Extracts clean text from raw HTML/candidates."""
+    if not candidates:
+        return ""
         
-    # Combine chunks for analysis
-    # Limit to reasonable context window if needed, though most input will be filtered by client size limits
-    full_text = "\n".join(raw_candidates)
+    full_text = "\n".join(candidates)
     
     system_prompt = """
     You are an expert content extractor. Your job is to take raw text from a webpage and extract the MAIN ARTICLE CONTENT.
-    Ignore:
-    - Navigation menus
-    - Footers
-    - Related article links
-    - Cookie warnings
-    - General site chrome
-    
-    If the text appears to be a Landing Page or Sales Page (long form sales letter), keep the sales copy as it is the "content".
-    
-    Return ONLY the cleaned text. Do not add any preamble or markdown formatting like "Here is the text".
+    Ignore navigation, footers, and general site chrome.
+    If it's a sales page, keep the sales copy.
+    Return ONLY the cleaned text.
     """
     
     try:
-        response = llm.invoke([
+        # We process extraction on the first X chars to avoid blowing context if it's huge, 
+        # but realistically the client sends decent candidates.
+        response = await llm.ainvoke([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"RAW TEXT:\n{full_text[:200000]}") # Increased Safety cap for full HTML
+            HumanMessage(content=f"RAW TEXT:\n{full_text[:50000]}") 
         ])
-        return {"clean_text": response.content}
+        return response.content
     except Exception as e:
         print(f"Extraction Error: {e}")
-        # Fallback to using raw text
-        return {"clean_text": full_text[:10000]}
+        return full_text[:20000]
 
-# Application of "Claim Identification" Agency
-def identify_claims(state: ScanState):
-    clean_text = state.get("clean_text", "")
-    
-    if not clean_text:
-        return {"extracted_claims": []}
-        
+# Helper for retries
+async def invoke_with_retry(messages, max_retries=3):
+    """Invokes LLM with exponential backoff for rate limits."""
+    for attempt in range(max_retries):
+        try:
+            return await llm.ainvoke(messages)
+        except Exception as e:
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt # 1s, 2s, 4s
+                    print(f"Rate limit hit. Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+            raise e
+    raise Exception("Max retries exceeded")
+
+async def identify_claims_in_chunk(chunk: str) -> List[str]:
+    """Identifies potential claims in a specific text chunk."""
     system_prompt = """
-    You are an expert investigative journalist. Your goal is to Identify specific CLAIMS in the text that match these categories:
-    1. Health claims (cures, treatments, medical advice).
-    2. Financial claims (returns, investments, money making).
-    3. Urgency claims (limited time, act now).
-    4. Trust/Authority claims (endorsements, "proven system").
+    You are an expert investigative journalist. Identify specific CLAIMS in the text that match:
+    1. Health claims (cures, treatments).
+    2. Financial claims (money making, returns).
+    3. Urgency claims (limited time).
+    4. Trust/Authority claims (endorsements).
     
-    Extract the EXACT sentences or phrases. Do not classify or debunk them yet. Just list them.
-    Return a JSON object with a single key "claims" containing a list of strings.
+    Extract the EXACT sentences. Return a JSON object: {"claims": ["claim 1", "claim 2"]}
     """
     
     try:
-        response = llm.invoke([
+        response = await invoke_with_retry([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"TEXT:\n{clean_text}")
+            HumanMessage(content=f"TEXT CHUNK:\n{chunk}")
         ])
         
-        # Parse JSON
-        content = response.content
+        content = response.content.strip()
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0]
         elif "```" in content:
             content = content.split("```")[1].split("```")[0]
             
-        data = json.loads(content.strip())
-        claims = data.get("claims", [])
-        return {"extracted_claims": claims}
-        
+        data = json.loads(content)
+        return data.get("claims", [])
     except Exception as e:
         print(f"Identification Error: {e}")
-        return {"extracted_claims": []}
+        return []
 
-# Application of "Verification" Agency
-def verify_claims(state: ScanState):
-    clean_text = state.get("clean_text", "")
-    extracted_claims = state.get("extracted_claims", [])
-    metadata = state.get("metadata", {})
-    indicators = state.get("indicators", [])
+async def verify_chunk_claims(chunk: str, claims: List[str]) -> List[Dict[str, Any]]:
+    """Verifies a list of claims against their chunk context."""
+    if not claims:
+        return []
+        
+    claims_text = "\n- ".join(claims)
     
-    metadata_text = json.dumps(metadata, indent=2)
-    indicators_text = ", ".join(indicators)
-    claims_text = "\n- ".join(extracted_claims)
+    system_prompt = """
+    You are an expert fact-checker. Analyze the provided claims based on the text context.
+    For each claim, determine if it is Misleading, Scam, or Legitimate.
     
-    system_prompt = f"""
-    You are an expert fact-checker. Analyze the identified claims from a webpage.
-    
-    Context:
-    - Metadata: {metadata_text}
-    - Indicators: {indicators_text}
-    
-    Your Task:
-    1. Determine the overall Page Risk and Trust Score.
-    2. For each extracted claim, analyze if it is Misleading, Scam, or Legitimate.
-    
-    Return a JSON object matching the ScanResult schema:
-    {{
-        "page_risk": "low" | "medium" | "high",
-        "trust_score": 0 to 100,
-        "summary": "Short summary...",
-        "claims": [
-            {{
+    Return a JSON object with key "verified_claims":
+    {
+        "verified_claims": [
+            {
                 "text": "Claim text",
-                "risk_level": "medium" | "high",
-                "category": "Health"...,
-                "explanation": "Why it is misleading...",
+                "risk_level": "low" | "medium" | "high",
+                "category": "Health" | "Financial" | "Urgency" | "Trust",
+                "explanation": "Brief explanation...",
                 "confidence": 0.0 to 1.0
-            }}
+            }
         ]
-    }}
+    }
     """
     
-    # If no specific claims were found but text exists, do a general page-level analysis
-    if not extracted_claims and clean_text:
-         user_message = f"""
-         No specific isolated claims found. Please analyze the Page Tone and Structure for risk.
-         
-         MAIN TEXT:
-         {clean_text[:5000]}
-         """
-    else:
-        user_message = f"""
-        CLAIMS TO VERIFY:
-        - {claims_text}
-        
-        FULL CONTEXT (for reference):
-        {clean_text[:10000]}
-        """
-    
     try:
-        response = llm.invoke([
+        response = await invoke_with_retry([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=user_message)
+            HumanMessage(content=f"CONTEXT:\n{chunk}\n\nCLAIMS TO VERIFY:\n- {claims_text}")
         ])
         
-        # Parse JSON
-        content = response.content
+        content = response.content.strip()
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0]
         elif "```" in content:
             content = content.split("```")[1].split("```")[0]
             
-        data = json.loads(content.strip())
-        scan_result = ScanResult(**data)
-        return {"results": scan_result.model_dump()}
-        
+        data = json.loads(content)
+        return data.get("verified_claims", [])
     except Exception as e:
         print(f"Verification Error: {e}")
-        # Log the failed content for debugging
-        if 'content' in locals():
-            print(f"Failed Content: {content[:500]}...") 
-        return {"results": {"page_risk": "unknown", "trust_score": 50, "summary": "Verification failed due to AI response error.", "claims": []}}
+        return []
 
-# Define the graph
-workflow = StateGraph(ScanState)
-workflow.add_node("extract", extract_content)
-workflow.add_node("identify", identify_claims)
-workflow.add_node("verify", verify_claims)
+async def analyze_aggregated_results(all_claims: List[Dict[str, Any]], full_text_summary: str) -> ScanResult:
+    """Calculates final score and summary based on all verified claims."""
+    
+    claims_dump = json.dumps(all_claims, indent=2)
+    
+    system_prompt = """
+    You are the Chief Risk Officer. Analyze the list of verified claims from a webpage scan.
+    
+    Your Goal:
+    1. specific: Calculate a 'trust_score' (0-100). 100 is perfectly safe, 0 is a definite scam.
+    2. Determine overall 'page_risk' (low, medium, high).
+    3. Write a short 'summary' (max 2 sentences) explaining the verdict.
+    
+    Return JSON matching ScanResult (minus the claims list, I will attach that later):
+    {
+        "page_risk": "low" | "medium" | "high",
+        "trust_score": 85,
+        "summary": "This page contains..."
+    }
+    """
+    
+    try:
+        response = await llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"VERIFIED CLAIMS:\n{claims_dump}\n\nPAGE CONTEXT SUMMARY:\n{full_text_summary[:5000]}")
+        ])
+        
+        content = response.content.strip()
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+            
+        data = json.loads(content)
+        # We manually construct ScanResult to ensure we keep the claims
+        return ScanResult(
+            page_risk=data.get("page_risk", "medium"),
+            trust_score=data.get("trust_score", 50),
+            summary=data.get("summary", "Analysis complete."),
+            claims=all_claims
+        )
+    except Exception as e:
+        print(f"Aggregation Error: {e}")
+        return ScanResult(
+            page_risk="unknown",
+            trust_score=50,
+            summary="Failed to generate final score.",
+            claims=all_claims
+        )
 
-workflow.set_entry_point("extract")
-workflow.add_edge("extract", "identify")
-workflow.add_edge("identify", "verify")
-workflow.add_edge("verify", END)
+# --- Orchestrator ---
 
-app_pipeline = workflow.compile()
+async def process_chunk(chunk: str) -> List[Dict[str, Any]]:
+    """Pipeline for a single chunk: Identify -> Verify."""
+    claims = await identify_claims_in_chunk(chunk)
+    if not claims:
+        return []
+    verified = await verify_chunk_claims(chunk, claims)
+    return verified
 
 async def run_page_scan(candidates: List[str], metadata: Dict[str, str] = {}, indicators: List[str] = []) -> ScanResult:
-    inputs = {
-        "candidates": candidates, 
-        "metadata": metadata, 
-        "indicators": indicators,
-        "clean_text": "",
-        "extracted_claims": [],
-        "results": {}
-    }
-    output = await app_pipeline.ainvoke(inputs)
-    return ScanResult(**output["results"])
+    # 1. Extract clean text
+    clean_text = await extract_content(candidates)
+    
+    # 2. Split into chunks
+    chunks = split_text(clean_text)
+    print(f"Split content into {len(chunks)} chunks.")
+    
+    # 3. Parallel Processing (Identify & Verify per chunk)
+    tasks = [process_chunk(chunk) for chunk in chunks]
+    results = await asyncio.gather(*tasks)
+    
+    # 4. Flatten Results
+    all_claims = []
+    for res in results:
+        all_claims.extend(res)
+        
+    print(f"Total claims found: {len(all_claims)}")
+        
+    # 5. Aggregate
+    final_result = await analyze_aggregated_results(all_claims, clean_text)
+    
+    return final_result
 
 async def run_text_scan(text: str) -> ScanResult:
     return await run_page_scan([text])
+
