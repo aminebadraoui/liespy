@@ -7,6 +7,7 @@ from db.models import User, Scan
 from db.session import get_session
 from uuid import uuid4
 from datetime import datetime, timedelta
+from api.utils import normalize_url
 
 router = APIRouter()
 
@@ -18,7 +19,7 @@ async def scan_page(
     # Check for cache if not forcing refresh
     if not request.force_refresh:
         # Normalize URL (basic)
-        normalized_url = request.url
+        normalized_url = normalize_url(request.url)
         
         statement = select(Scan).where(Scan.url == normalized_url).order_by(Scan.created_at.desc())
         result = await session.execute(statement)
@@ -48,7 +49,7 @@ async def scan_page(
     
     # 2. Store in Supabase
     new_scan = Scan(
-        url=request.url,
+        url=normalize_url(request.url),
         result=result_data.model_dump(), # Convert Pydantic model to dict
         score=None, #/ TODO: Calculate score
         user_id=None #/ TODO: Link to user if auth enabled
@@ -99,9 +100,10 @@ async def scan_aggregate_endpoint(
     # but for now we just store the result as a new scan entry.
     # Ideally, the client passes the URL in metadata for logging.
     url = request.metadata.get("url", "https://aggregated-result.com")
+    normalized_url = normalize_url(url)
     
     new_scan = Scan(
-        url=url,
+        url=normalized_url,
         result=result_data.model_dump(),
         score=result_data.trust_score,
         user_id=None 
