@@ -174,6 +174,15 @@ async def verify_chunk_claims(chunk: str, claims: List[str]) -> List[Dict[str, A
 async def analyze_aggregated_results(all_claims: List[Dict[str, Any]], full_text_summary: str) -> ScanResult:
     """Calculates final score and summary based on all verified claims."""
     
+    # Validation: If no claims and no summary, we can't analyze anything.
+    if not all_claims and not full_text_summary:
+        return ScanResult(
+            page_risk="unknown",
+            trust_score=0,
+            summary="No content was available for analysis. The page might be empty or content extraction failed.",
+            claims=[]
+        )
+    
     claims_dump = json.dumps(all_claims, indent=2)
     
     system_prompt = """
