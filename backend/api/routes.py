@@ -18,7 +18,7 @@ async def scan_page(
     # Check for cache if not forcing refresh
     if not request.force_refresh:
         # Normalize URL (basic)
-        normalized_url = request.candidates[0].url # Assuming single URL for now
+        normalized_url = request.url
         
         statement = select(Scan).where(Scan.url == normalized_url).order_by(Scan.created_at.desc())
         result = await session.execute(statement)
@@ -33,15 +33,23 @@ async def scan_page(
                 created_at=cached_scan.created_at,
                 is_cached=True
             )
+    
+    # If we only wanted to check cache, and found nothing
+    if request.only_check_cache:
+        raise HTTPException(status_code=404, detail="No cached scan found")
 
     # 1. Orchestrate AI Pipeline
     # TODO: Pass force_refresh to pipeline if needed
-    result_data: ScanResult = await run_page_scan(request.candidates)
+    result_data: ScanResult = await run_page_scan(
+        candidates=request.candidates,
+        metadata=request.metadata,
+        indicators=request.indicators
+    )
     
     # 2. Store in Supabase
     new_scan = Scan(
-        url=request.candidates[0].url,
-        result=result_data.dict(), # Convert Pydantic model to dict
+        url=request.url,
+        result=result_data.model_dump(), # Convert Pydantic model to dict
         score=None, #/ TODO: Calculate score
         user_id=None #/ TODO: Link to user if auth enabled
     )

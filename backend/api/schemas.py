@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 from uuid import UUID
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -23,7 +23,10 @@ class ScanResult(BaseModel):
 class PageScanRequest(BaseModel):
     url: Optional[str] = None
     candidates: List[str] # List of extracted sentences
+    metadata: Dict[str, str] = {}
+    indicators: List[str] = []
     force_refresh: bool = False
+    only_check_cache: bool = False
 
 class TextScanRequest(BaseModel):
     text: str
